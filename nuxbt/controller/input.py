@@ -1,5 +1,5 @@
 from time import perf_counter
-from json import dumps
+from json import dumps, loads
 
 
 DIRECT_INPUT_IDLE_PACKET = {
@@ -96,7 +96,14 @@ class InputParser():
         # The start time for the current macro commands
         self.macro_timer_start = 0
 
-        self.controller_input = None
+        # The latest direct-input packet. Held (not consumed) so the mainloop
+        # can re-apply it on every send: the protocol report is ephemeral
+        # (get_report() clears it and process_commands() rebuilds a neutral
+        # baseline each cycle), so a held button/stick must be re-parsed every
+        # loop or the resends between input events would carry a neutral report
+        # and the input would stutter. Starts idle so active/idle checks are
+        # correct before the first event arrives.
+        self.controller_input = loads(dumps(DIRECT_INPUT_IDLE_PACKET))
 
         # Whether or not input has been entered
         # that would close the "Change Grip/Order" menu
@@ -181,10 +188,12 @@ class InputParser():
 
     def set_protocol_input(self, state=None):
 
-        # Act on direct input if we're not getting idle packets
+        # Act on direct input if we're not getting idle packets. Re-applied
+        # every cycle (not consumed): the protocol report is rebuilt fresh each
+        # loop, so a held input must be re-parsed each time or resends between
+        # input events would send a neutral report and the input would stutter.
         if dumps(self.controller_input) != dumps(DIRECT_INPUT_IDLE_PACKET):
             self.parse_controller_input(self.controller_input)
-            self.controller_input = None
 
         elif (self.macro_buffer or self.current_macro or
               self.current_macro_commands):
@@ -253,10 +262,15 @@ class InputParser():
             upper[0] = '1'
 
         # Shared byte
+        # Switch HID shared button byte: bit 0 = Minus, bit 1 = Plus. Here the
+        # bit array is MSB-first (shared[7] is bit 0), so Minus -> shared[7] and
+        # Plus -> shared[6]. This matches the macro path (set_macro_input) and
+        # fixes a swap that previously made direct input report Plus as Minus
+        # and vice versa.
         if controller_input["MINUS"]:
-            shared[6] = '1'
-        if controller_input["PLUS"]:
             shared[7] = '1'
+        if controller_input["PLUS"]:
+            shared[6] = '1'
         if controller_input["R_STICK"]["PRESSED"]:
             shared[5] = '1'
         if controller_input["L_STICK"]["PRESSED"]:

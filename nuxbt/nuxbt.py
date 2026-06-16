@@ -137,6 +137,7 @@ class NuxbtCommands(Enum):
     CLEAR_ALL_MACROS = 4
     REMOVE_CONTROLLER = 5
     QUIT = 6
+    SET_INPUT = 7
 
 
 class Nuxbt():
@@ -317,6 +318,10 @@ class Nuxbt():
                     elif msg["command"] == NuxbtCommands.CLEAR_MACROS:
                         cm.clear_macros(
                             msg["arguments"]["controller_index"])
+                    elif msg["command"] == NuxbtCommands.SET_INPUT:
+                        cm.set_controller_input(
+                            msg["arguments"]["controller_index"],
+                            msg["arguments"]["input_packet"])
                     elif msg["command"] == NuxbtCommands.REMOVE_CONTROLLER:
                         index = msg["arguments"]["controller_index"]
                         cm.clear_macros(index)
@@ -543,7 +548,20 @@ class Nuxbt():
         if controller_index not in self.manager_state.keys():
             raise ValueError("Specified controller does not exist")
 
+        # Mirror the latest input into the shared state purely so external
+        # observers (e.g. the web UI) can display it. The controller hot loop
+        # no longer reads this; it receives input as an event below.
         self.manager_state[controller_index]["direct_input"] = input_packet
+
+        # Push the input as an event so the controller's mainloop wakes
+        # immediately (via select) instead of waiting for the next poll tick.
+        self.task_queue.put({
+            "command": NuxbtCommands.SET_INPUT,
+            "arguments": {
+                "controller_index": controller_index,
+                "input_packet": input_packet,
+            }
+        })
 
     def create_input_packet(self):
         """Creates an input packet that is used to specify the input
@@ -643,6 +661,7 @@ class Nuxbt():
             # This needs to be done to prevent race conditions
             # on Bluetooth resources.
             if type(controller_index) == int:
+                start = time.time()
                 while True:
                     if controller_index in self.manager_state.keys():
                         state = self.manager_state[controller_index]
@@ -651,6 +670,9 @@ class Nuxbt():
                                 state["state"] == "crashed"):
                             break
 
+                    if time.time() - start > 60:
+                        raise TimeoutError(
+                            "Timed out waiting for controller to initialize")
                     time.sleep(1/30)
         finally:
             self._controller_lock.release()
@@ -698,11 +720,15 @@ class Nuxbt():
         :type controller_index: int
         """
 
+        start = time.time()
         while not self.state[controller_index]["state"] == "connected":
             if self.state[controller_index]["state"] == "crashed":
                 raise OSError("The watched controller has crashe with error",
                               self.state[controller_index]["errors"])
-            pass
+            if time.time() - start > 120:
+                raise TimeoutError(
+                    "Timed out waiting for controller to connect")
+            time.sleep(1/30)
 
     def get_available_adapters(self):
         """Gets the DBus paths of all available Bluetooth
@@ -852,6 +878,13 @@ class _ControllerManager():
 
         self._controller_queues[index].put({
             "type": "clear",
+        })
+
+    def set_controller_input(self, index, input_packet):
+
+        self._controller_queues[index].put({
+            "type": "direct",
+            "input": input_packet,
         })
 
     def remove_controller(self, index):

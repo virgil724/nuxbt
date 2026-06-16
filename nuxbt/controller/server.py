@@ -3,11 +3,11 @@ import fcntl
 import os
 import time
 import queue
+import select
 import logging
 import traceback
 import atexit
 from threading import Thread
-import statistics as stat
 
 from .controller import Controller, ControllerTypes
 from ..bluez import BlueZ, find_devices_by_alias
@@ -49,6 +49,10 @@ class ControllerServer():
 
         self.reconnect_counter = 0
 
+        self._crw_running = False
+        self._watchdog_connected_devices = []
+        self._watchdog_connected_devices_count = {}
+
         # Intializing Bluetooth
         self.bt = BlueZ(adapter_path=adapter_path)
 
@@ -61,11 +65,6 @@ class ControllerServer():
 
         self.input = InputParser(self.protocol)
 
-        # Debug timekeeping storage array
-        self.times = []
-
-        # Initial reconnection overload protection
-        self.tick = 1
         self.cached_msg = ''
 
     def run(self, reconnect_address=None):
@@ -115,41 +114,96 @@ class ControllerServer():
             except Exception as e:
                 self.logger.debug("Error during graceful shutdown:")
                 self.logger.debug(traceback.format_exc())
+        finally:
+            self._crw_running = False
+
+    # While active input is held (button down/stick tilted/macro running)
+    # we resend at the Bluetooth interval so a single lost packet doesn't
+    # drop the input and so macro timing keeps advancing.
+    ACTIVE_INTERVAL = 1 / 132
+    # When idle, send a keepalive report every so often so the Switch
+    # doesn't drop the controller (replaces the old tick >= 132 counter).
+    KEEPALIVE_INTERVAL = 1.0
+
+    def _sync_controller_input(self):
+        """Drain the per-controller task queue and sync input from shared state.
+
+        Direct input is level-triggered: the shared Manager dict (kept up to
+        date by the main process for observers like the web UI) is the
+        authoritative source. Queue events are used only as a wakeup signal
+        so that input changes are detected with low latency; the packet data
+        carried by the queue is intentionally ignored to avoid staying stuck
+        on a stale held input when a release event is dropped upstream.
+
+        Macros and control commands still travel through the queue and are
+        processed normally.
+        """
+
+        if self.task_queue is None:
+            return
+
+        input_changed = False
+
+        # Drain the task queue every loop. This is cheap when empty and
+        # avoids missed wakeups from the Queue's internal buffer being out
+        # of sync with the pipe that select() watches.
+        try:
+            while True:
+                msg = self.task_queue.get_nowait()
+                if msg and msg["type"] == "macro":
+                    self.input.buffer_macro(msg["macro"], msg["macro_id"])
+                elif msg and msg["type"] == "stop":
+                    self.input.stop_macro(msg["macro_id"], state=self.state)
+                elif msg and msg["type"] == "clear":
+                    self.input.clear_macros()
+                elif msg and msg["type"] == "direct":
+                    # Direct input events are wakeup hints only; the actual
+                    # state is read from shared memory below so a dropped
+                    # release event cannot stick a held button.
+                    input_changed = True
+        except queue.Empty:
+            pass
+
+        # Re-sync from the authoritative shared state whenever we know an
+        # input event arrived or while we believe a button/stick is held.
+        # This restores the level-triggered semantics the original polling
+        # loop had, while keeping event-driven wakeup latency for changes.
+        if input_changed or self.input.active_input_queued():
+            latest = self.state.get("direct_input")
+            if latest is not None:
+                self.input.set_controller_input(latest)
 
     def mainloop(self, itr, ctrl):
 
-        duration_start = time.perf_counter()
-        while True:
-            # Start timing command processing
-            timer_start = time.perf_counter()
+        # The interrupt socket plus the task queue's read end form the set of
+        # event sources. select() blocks until the Switch sends something, an
+        # input/macro event arrives, or the timeout fires, instead of polling
+        # shared state on a fixed timer.
+        if self.task_queue is not None:
+            queue_reader = self.task_queue._reader
+        else:
+            queue_reader = None
 
-            # Attempt to get output from Switch
+        while True:
+            # Hold/macro active -> wake at the BT interval to keep resending.
+            # Idle -> wake at the keepalive interval.
+            timeout = (self.ACTIVE_INTERVAL
+                       if self.input.active_input_queued()
+                       else self.KEEPALIVE_INTERVAL)
+
+            read_set = [itr] if queue_reader is None else [itr, queue_reader]
+            readable, _, _ = select.select(read_set, [], [], timeout)
+            timed_out = not readable
+
+            # Attempt to get output from Switch (itr stays non-blocking)
             try:
                 reply = itr.recv(50)
-                if len(reply) > 40:
+                if self.logger_level <= logging.DEBUG and len(reply) > 40:
                     self.logger.debug(format_msg_switch(reply))
             except BlockingIOError:
                 reply = None
 
-            # Getting any inputs from the task queue
-            if self.task_queue:
-                try:
-                    while True:
-                        msg = self.task_queue.get_nowait()
-                        if msg and msg["type"] == "macro":
-                            self.input.buffer_macro(
-                                msg["macro"], msg["macro_id"])
-                        elif msg and msg["type"] == "stop":
-                            self.input.stop_macro(
-                                msg["macro_id"], state=self.state)
-                        elif msg and msg["type"] == "clear":
-                            self.input.clear_macros()
-                except queue.Empty:
-                    pass
-
-            # Set Direct Input
-            if self.state["direct_input"]:
-                self.input.set_controller_input(self.state["direct_input"])
+            self._sync_controller_input()
 
             self.protocol.process_commands(reply)
             self.input.set_protocol_input(state=self.state)
@@ -166,47 +220,35 @@ class ControllerServer():
                 if self.input.active_input_queued():
                     itr.sendall(msg)
                     self.cached_msg = msg[3:]
-                    self.tick = 0
-                # If nothing is pressed, just send the message once and cache it
-                # to prevent overloading the switch with packets on the "Change Grip/Order" menu. 
+                # If the report changed (input change or a subcommand reply
+                # from the Switch), send it once and cache it to avoid
+                # flooding the Switch on the "Change Grip/Order" menu.
                 elif msg[3:] != self.cached_msg:
                     itr.sendall(msg)
                     self.cached_msg = msg[3:]
-                    self.tick = 0
-                # Send a blank packet every so often to keep the Switch
-                # from disconnecting from the controller.
-                elif self.tick >= 132:
+                # The Switch sent us something that needs a reply.
+                elif reply:
                     itr.sendall(msg)
-                    self.tick = 0
+                # Idle keepalive so the Switch doesn't drop the controller.
+                elif timed_out:
+                    itr.sendall(msg)
             except BlockingIOError:
                 continue
             except OSError as e:
+                # The interrupt socket died; close the stale sockets before
+                # reconnecting so we don't leak them or hold PSM 17/19.
+                for sock in (itr, ctrl):
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
                 # Attempt to reconnect to the Switch
                 itr, ctrl = self.save_connection(e)
-
-            # Figure out how long it took to process commands
-            duration_end = time.perf_counter()
-            duration_elapsed = duration_end - duration_start
-            duration_start = duration_end
-            
-            sleep_time = 1/132 - duration_elapsed
-            if sleep_time >= 0:
-                time.sleep(sleep_time)
-            self.tick += 1
-
-            if self.logger_level <= logging.DEBUG:
-                self.times.append(duration_elapsed)
-                if len(self.times) > 100:
-                    self.times.pop()
-                mean_time = stat.mean(self.times)
-
-                self.logger.debug(
-                    f"Tick: {self.tick}, Mean Time: {str(1/mean_time)}")
 
 
     def save_connection(self, error, state=None):
 
-        while self.reconnect_counter < 2:
+        while self.reconnect_counter < 10:
             try:
                 self.logger.debug("Attempting to reconnect")
                 # Reinitialize the protocol
@@ -254,7 +296,7 @@ class ControllerServer():
                         # Switch responds to packets slower during pairing
                         # Pairing cycle responds optimally on a 15Hz loop
                         if not received_first_message:
-                            time.sleep(1)
+                            time.sleep(0.05)
                         else:
                             time.sleep(1/15)
 
@@ -272,9 +314,6 @@ class ControllerServer():
         # to connect to any Switch.
         self.logger.debug("Connecting to any Switch")
         self.reconnect_counter = 0
-
-        # Reinitialize initial communication overload protections
-        self.tick = 1
 
         # Reinitialize the protocol
         self.protocol = ControllerProtocol(
@@ -304,41 +343,41 @@ class ControllerServer():
 
         self.state["state"] = "connected"
 
-        self.switch_address = itr.getsockname()[0]
+        # Store the Switch's address (the remote peer), not our own adapter,
+        # so a later reconnect() targets the Switch instead of looping back.
+        self.switch_address = itr.getpeername()[0]
 
         return itr, ctrl
 
     def connection_reset_watchdog(self):
 
-        connected_devices = []
-        connected_devices_count = {}
         while self._crw_running:
-            paths = self.bt.find_connected_devices(alias_filter="Nintendo Switch")
-            # Keep track of Switches that connect
-            if len(paths) > 0:
-                connected_devices = list(set(connected_devices + paths))
-            
-            # Increment a counter if a Switch connected and disconnected
-            disconnected = list(set(connected_devices) - set(paths))
-            if len(disconnected) > 0:
-                for path in disconnected:
-                    if path not in connected_devices_count.keys():
-                        connected_devices_count[path] = 1
-                    else:
-                        connected_devices_count[path] += 1
-                connected_devices = list(set(connected_devices) - set(disconnected))
-            
-            # Delete Switches that connect/disconnect twice.
-            # This behaviour is characteristic of connection issues and is corrected
-            # by removing the Switch's connection to the system.
-            if len(connected_devices_count.keys()) > 0:
-                for key in connected_devices_count.keys():
-                    if connected_devices_count[key] >= 2:
+            try:
+                paths = self.bt.find_connected_devices(alias_filter="Nintendo Switch")
+                if len(paths) > 0:
+                    self._watchdog_connected_devices = list(
+                        set(self._watchdog_connected_devices + paths))
+
+                disconnected = list(
+                    set(self._watchdog_connected_devices) - set(paths))
+                if len(disconnected) > 0:
+                    for path in disconnected:
+                        self._watchdog_connected_devices_count[path] = (
+                            self._watchdog_connected_devices_count.get(path, 0) + 1
+                        )
+                    self._watchdog_connected_devices = list(
+                        set(self._watchdog_connected_devices) - set(disconnected))
+
+                for key, count in list(self._watchdog_connected_devices_count.items()):
+                    if count >= 2:
                         self.logger.debug(
                             "A Nintendo Switch disconnected. Resetting Connection...")
                         self.logger.debug(f"Removing {str(key)}")
                         self.bt.remove_device(key)
-                        connected_devices_count[key] = 0
+                        self._watchdog_connected_devices_count[key] = 0
+            except Exception:
+                self.logger.debug("Watchdog error (DBus / BlueZ transient):")
+                self.logger.debug(traceback.format_exc())
 
             time.sleep(0.1)
 
@@ -352,6 +391,7 @@ class ControllerServer():
         # succeeds. This prevents situations where the Switch will
         # disconnect during a connection.
         while True:
+            s_ctrl = s_itr = None
             try:
                 self.state["state"] = "connecting"
 
@@ -364,6 +404,9 @@ class ControllerServer():
                     family=socket.AF_BLUETOOTH,
                     type=socket.SOCK_SEQPACKET,
                     proto=socket.BTPROTO_L2CAP)
+
+                s_ctrl.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s_itr.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
                 # Setting up HID interrupt/control sockets
                 try:
@@ -385,13 +428,11 @@ class ControllerServer():
                 self.bt.set_class("0x02508")
 
                 self._crw_running = True
-                crw = Thread(target = self.connection_reset_watchdog)
+                crw = Thread(target = self.connection_reset_watchdog, daemon=True)
                 crw.start()
 
                 itr, itr_address = s_itr.accept()
                 ctrl, ctrl_address = s_ctrl.accept()
-
-                self._crw_running = False
 
                 # Send an empty input report to the Switch to prompt a reply
                 self.protocol.process_commands(None)
@@ -436,14 +477,16 @@ class ControllerServer():
 
                     # Switch responds to packets slower during pairing
                     # Pairing cycle responds optimally on a 15Hz loop
-                    if not received_first_message:
-                        time.sleep(1)
-                    else:
-                        time.sleep(1/15)
+                    time.sleep(1/15)
                 
                 break
             except OSError as e:
                 self.logger.debug(e)
+                for sock in (s_ctrl, s_itr):
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
 
         self.input.exited_grip_order_menu = False
 
@@ -487,6 +530,8 @@ class ControllerServer():
                     test_itr.close()
                     test_ctrl.close()
                     pass
+                else:
+                    break
         elif type(reconnect_address) == str:
             test_itr, test_ctrl = recreate_sockets()
 
@@ -508,12 +553,10 @@ class ControllerServer():
         msg = self.protocol.get_report()
         itr.sendall(msg)
 
-        # Setting interrupt connection as non-blocking
-        # In this case, non-blocking means it throws a "BlockingIOError"
-        # for sending and receiving, instead of blocking
-        fcntl.fcntl(itr, fcntl.F_SETFL, os.O_NONBLOCK)
-
         return itr, ctrl
 
     def _on_exit(self):
+        self._crw_running = False
+        self._watchdog_connected_devices = []
+        self._watchdog_connected_devices_count = {}
         self.bt.reset_adapter()
