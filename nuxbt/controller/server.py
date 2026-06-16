@@ -125,6 +125,54 @@ class ControllerServer():
     # doesn't drop the controller (replaces the old tick >= 132 counter).
     KEEPALIVE_INTERVAL = 1.0
 
+    def _sync_controller_input(self):
+        """Drain the per-controller task queue and sync input from shared state.
+
+        Direct input is level-triggered: the shared Manager dict (kept up to
+        date by the main process for observers like the web UI) is the
+        authoritative source. Queue events are used only as a wakeup signal
+        so that input changes are detected with low latency; the packet data
+        carried by the queue is intentionally ignored to avoid staying stuck
+        on a stale held input when a release event is dropped upstream.
+
+        Macros and control commands still travel through the queue and are
+        processed normally.
+        """
+
+        if self.task_queue is None:
+            return
+
+        input_changed = False
+
+        # Drain the task queue every loop. This is cheap when empty and
+        # avoids missed wakeups from the Queue's internal buffer being out
+        # of sync with the pipe that select() watches.
+        try:
+            while True:
+                msg = self.task_queue.get_nowait()
+                if msg and msg["type"] == "macro":
+                    self.input.buffer_macro(msg["macro"], msg["macro_id"])
+                elif msg and msg["type"] == "stop":
+                    self.input.stop_macro(msg["macro_id"], state=self.state)
+                elif msg and msg["type"] == "clear":
+                    self.input.clear_macros()
+                elif msg and msg["type"] == "direct":
+                    # Direct input events are wakeup hints only; the actual
+                    # state is read from shared memory below so a dropped
+                    # release event cannot stick a held button.
+                    input_changed = True
+        except queue.Empty:
+            pass
+
+        # Re-sync from the authoritative shared state whenever we know an
+        # input event arrived or while we believe a button/stick is held.
+        # This restores the level-triggered semantics the original polling
+        # loop had, while keeping event-driven wakeup latency for changes.
+        if input_changed or self.input.active_input_queued():
+            latest = self.state.get("direct_input")
+            if latest is not None:
+                self.input.set_controller_input(latest)
+
     def mainloop(self, itr, ctrl):
 
         # The interrupt socket plus the task queue's read end form the set of
@@ -155,25 +203,7 @@ class ControllerServer():
             except BlockingIOError:
                 reply = None
 
-            # Drain the task queue every loop. This is cheap when empty and
-            # avoids missed wakeups from the Queue's internal buffer being out
-            # of sync with the pipe that select() watches.
-            if self.task_queue is not None:
-                try:
-                    while True:
-                        msg = self.task_queue.get_nowait()
-                        if msg and msg["type"] == "macro":
-                            self.input.buffer_macro(
-                                msg["macro"], msg["macro_id"])
-                        elif msg and msg["type"] == "stop":
-                            self.input.stop_macro(
-                                msg["macro_id"], state=self.state)
-                        elif msg and msg["type"] == "clear":
-                            self.input.clear_macros()
-                        elif msg and msg["type"] == "direct":
-                            self.input.set_controller_input(msg["input"])
-                except queue.Empty:
-                    pass
+            self._sync_controller_input()
 
             self.protocol.process_commands(reply)
             self.input.set_protocol_input(state=self.state)

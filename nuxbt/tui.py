@@ -1,3 +1,5 @@
+import copy
+import json
 import os
 import time
 import psutil
@@ -519,6 +521,7 @@ class InputTUI():
 
         def input_worker(nuxbt, controller_index, input_packet):
 
+            last_sent = None
             while True:
                 packet = input_packet["packet"]
 
@@ -550,7 +553,15 @@ class InputTUI():
                 packet["R_STICK"]["X_VALUE"] = rs_x_value
                 packet["R_STICK"]["Y_VALUE"] = rs_y_value
 
-                nuxbt.set_controller_input(controller_index, packet)
+                # Only send when the input state changes. The controller's
+                # mainloop re-applies the last packet at 132Hz for held inputs,
+                # so the worker does not need to resend the same state.
+                packet_json = json.dumps(packet, sort_keys=True)
+                if packet_json != last_sent:
+                    nuxbt.set_controller_input(
+                        controller_index, copy.deepcopy(packet))
+                    last_sent = packet_json
+
                 time.sleep(1/120)
 
         input_process = multiprocessing.Process(
