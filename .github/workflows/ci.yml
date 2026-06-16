@@ -3,6 +3,7 @@ name: Check Commits and Run Tests
 on:
   pull_request:
     branches: main
+  workflow_dispatch:
 jobs:
   check:
     runs-on: ubuntu-latest
