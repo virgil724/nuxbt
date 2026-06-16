@@ -248,7 +248,7 @@ class ControllerServer():
 
     def save_connection(self, error, state=None):
 
-        while self.reconnect_counter < 2:
+        while self.reconnect_counter < 10:
             try:
                 self.logger.debug("Attempting to reconnect")
                 # Reinitialize the protocol
@@ -352,28 +352,32 @@ class ControllerServer():
     def connection_reset_watchdog(self):
 
         while self._crw_running:
-            paths = self.bt.find_connected_devices(alias_filter="Nintendo Switch")
-            if len(paths) > 0:
-                self._watchdog_connected_devices = list(
-                    set(self._watchdog_connected_devices + paths))
+            try:
+                paths = self.bt.find_connected_devices(alias_filter="Nintendo Switch")
+                if len(paths) > 0:
+                    self._watchdog_connected_devices = list(
+                        set(self._watchdog_connected_devices + paths))
 
-            disconnected = list(
-                set(self._watchdog_connected_devices) - set(paths))
-            if len(disconnected) > 0:
-                for path in disconnected:
-                    self._watchdog_connected_devices_count[path] = (
-                        self._watchdog_connected_devices_count.get(path, 0) + 1
-                    )
-                self._watchdog_connected_devices = list(
-                    set(self._watchdog_connected_devices) - set(disconnected))
+                disconnected = list(
+                    set(self._watchdog_connected_devices) - set(paths))
+                if len(disconnected) > 0:
+                    for path in disconnected:
+                        self._watchdog_connected_devices_count[path] = (
+                            self._watchdog_connected_devices_count.get(path, 0) + 1
+                        )
+                    self._watchdog_connected_devices = list(
+                        set(self._watchdog_connected_devices) - set(disconnected))
 
-            for key, count in list(self._watchdog_connected_devices_count.items()):
-                if count >= 2:
-                    self.logger.debug(
-                        "A Nintendo Switch disconnected. Resetting Connection...")
-                    self.logger.debug(f"Removing {str(key)}")
-                    self.bt.remove_device(key)
-                    self._watchdog_connected_devices_count[key] = 0
+                for key, count in list(self._watchdog_connected_devices_count.items()):
+                    if count >= 2:
+                        self.logger.debug(
+                            "A Nintendo Switch disconnected. Resetting Connection...")
+                        self.logger.debug(f"Removing {str(key)}")
+                        self.bt.remove_device(key)
+                        self._watchdog_connected_devices_count[key] = 0
+            except Exception:
+                self.logger.debug("Watchdog error (DBus / BlueZ transient):")
+                self.logger.debug(traceback.format_exc())
 
             time.sleep(0.1)
 
